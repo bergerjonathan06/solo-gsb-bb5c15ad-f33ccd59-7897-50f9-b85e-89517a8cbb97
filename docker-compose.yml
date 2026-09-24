@@ -25,6 +25,10 @@ services:
       LIMIT_IDEM_KEY_PREFIX: "ratelimit-idem"
       LIMITS_MIN_WINDOW_MS: "1"
       LIMITS_MAX_WINDOW_MS: "86400000"
+      # 单个任务键允许保存的去重后前置任务键数量上限
+      DEPENDENCY_MAX_PREREQUISITES: "16"
+      # 保存依赖时 Lua 环检测单次遍历最多访问的节点数（超限拒绝并保留原定义）
+      DEPENDENCY_MAX_TRAVERSAL_NODES: "1024"
     ports:
       - "8000:8000"
     depends_on:

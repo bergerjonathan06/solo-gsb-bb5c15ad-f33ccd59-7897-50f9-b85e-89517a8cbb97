@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     limits_max_window_ms: int = Field(
         default=86_400_000, validation_alias="LIMITS_MAX_WINDOW_MS"
     )
+    # 单个任务键允许保存的去重后前置任务键数量上限
+    dependency_max_prerequisites: int = Field(
+        default=16, ge=1, validation_alias="DEPENDENCY_MAX_PREREQUISITES"
+    )
+    # 保存依赖时沿现有定义做环检测，单次遍历最多访问的节点数，
+    # 超出即拒绝并保留原定义（防止在超大依赖图上单脚本执行过久）
+    dependency_max_traversal_nodes: int = Field(
+        default=1_024, ge=1, validation_alias="DEPENDENCY_MAX_TRAVERSAL_NODES"
+    )
 
 
 @lru_cache

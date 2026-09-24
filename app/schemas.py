@@ -433,3 +433,50 @@ class LimitCheckResponse(BaseModel):
         ge=0,
         description="仅超限时返回：建议等待毫秒数（至最老一笔成本滑出窗口）",
     )
+
+
+class DependencySetRequest(BaseModel):
+    """保存任务的前置任务键集合（整体替换原定义）。"""
+
+    dependencies: list[TaskKey] = Field(
+        examples=[["video-transcode:order-123", "video-transcode:order-456"]],
+        description=(
+            "前置任务键列表，服务端按首次出现顺序去重；"
+            "去重后最多 DEPENDENCY_MAX_PREREQUISITES 个（默认 16），"
+            "不允许包含路径参数中的 task_key 自身，可为空数组（清空定义）"
+        ),
+    )
+
+
+class DependencySetResponse(BaseModel):
+    task_key: str
+    dependencies: list[str] = Field(
+        description=(
+            "生效中的去重前置任务键（按首次出现顺序）；"
+            "保存被拒绝（409）时为未改动的原定义"
+        )
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "仅 409 时返回：cycle（存在环，含自身依赖）/"
+            "traversal_limit（沿现有定义遍历节点超过上限）"
+        ),
+    )
+
+
+class DependencyReadyResponse(BaseModel):
+    task_key: str
+    ready: bool = Field(
+        description=(
+            "是否可执行：所有前置任务均已提交持久结果（或该任务没有依赖定义、"
+            "依赖定义为空）时为 true"
+        )
+    )
+    pending: list[str] = Field(
+        default_factory=list,
+        description=(
+            "尚未提交持久结果的前置任务键（按依赖定义顺序去重）；"
+            "为空且 ready=true 时表示所有前置均已就绪"
+        ),
+    )

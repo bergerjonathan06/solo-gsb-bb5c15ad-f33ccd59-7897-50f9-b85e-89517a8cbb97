@@ -32,6 +32,14 @@
 提交并覆盖为新结果。`GET /v1/results/{task_key}` 返回最近一次已提交结果及其防栅
 序号；**结果不设 TTL，不随租约到期删除**。
 
+还提供**任务依赖门禁 API**：`POST /v1/dependencies/{task_key}` 保存任务的前置
+任务键集合（按首次出现顺序**去重**、最多 **16** 个、空数组清空定义、**禁止自身
+依赖**）；保存时在 **Redis Lua** 中沿**现有依赖定义**遍历检测环，单次最多访问
+**1024** 个节点，发现环或超限时拒绝写入并**原样保留原定义**。
+`GET /v1/dependencies/{task_key}/ready` 依据**已提交的持久任务结果**判断所有前置
+任务是否都已完成，返回 `ready` 与未完成键列表；**没有依赖定义的任务视为可执行**。
+依赖键沿用租约 / 结果同一 Redis 前缀（`:deps:` 命名空间）。
+
 技术栈：Python 3.12 · FastAPI · Redis 7（Lua 脚本保证原子性）
 
 ## 快速开始（一条命令）
@@ -67,6 +75,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | `LIMIT_IDEM_KEY_PREFIX` | `ratelimit-idem` | 限流幂等记录 Redis 键前缀，与限流 ZSet 隔离 |
 | `LIMITS_MIN_WINDOW_MS` | `1` | 允许的最小限流窗口（毫秒） |
 | `LIMITS_MAX_WINDOW_MS` | `86400000` | 允许的最大限流窗口（毫秒，默认 1 天） |
+| `DEPENDENCY_MAX_PREREQUISITES` | `16` | 单个任务键允许保存的去重后前置任务键数量上限 |
+| `DEPENDENCY_MAX_TRAVERSAL_NODES` | `1024` | 保存依赖时 Lua 环检测单次遍历最多访问的节点数；超限拒绝并保留原定义 |
 
 服务端口固定为 **8000**（容器内），可在 `docker-compose.yml` 的 `ports` 中调整宿主机映射。
 
@@ -87,6 +97,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
 | POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409 |
 | GET | `/v1/results/{task_key}` | 读取最近一次已提交结果及防栅序号（持久保留，不随租约到期删除） |
+| POST | `/v1/dependencies/{task_key}` | 保存前置依赖（去重、最多 16 个、禁止自身依赖）；Lua 原子检测环 / 遍历上限，拒绝 409 且保留原定义 |
+| GET | `/v1/dependencies/{task_key}/ready` | 依据持久任务结果判断前置是否全部已提交；无定义视为可执行，返回 `ready` 与 `pending` |
 | POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减，可选 `request_id` 幂等），放行 200 / 超限 429 |
 | GET | `/healthz` | 健康检查 |
 
@@ -245,6 +257,81 @@ curl -s localhost:8000/v1/results/report:daily
 | `replayed` | 响应 | 同一防栅序号已提交且内容一致时为 `true`，响应头同时带 `Result-Replay: true`；不刷新 `committed_at_ms` |
 | `committed_at_ms` | 响应 | 结果首次提交时刻（Redis 服务器时钟，Unix 毫秒），重放 / 覆盖语义见上 |
 | `reason` | 响应 | 仅 409 时返回：`not_found` / `conflict` / `expired` / `result_conflict` |
+
+### 任务依赖门禁
+
+每个任务键可以保存一组**前置任务键**（整体替换原定义）。保存时在单个 Redis
+Lua 脚本内先沿**现有定义**有向遍历检测环、再决定是否写入，因此成环或遍历规模
+超限的请求不会改动任何已有定义。就绪判定只认**已提交的持久任务结果**
+（`POST /v1/results/commit` 写入、不设 TTL），与租约是否仍有效无关。
+
+```bash
+# 1. 保存前置依赖：按首次出现顺序去重，最多 16 个（空数组 = 清空定义）
+curl -s -X POST localhost:8000/v1/dependencies/report:daily \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies": ["extract:users", "extract:orders", "extract:users"]}'
+# => 200（重复的 extract:users 只保留一份，顺序为首次出现顺序）
+# {"task_key":"report:daily","dependencies":["extract:users","extract:orders"],
+#  "reason":null}
+
+# 2. 查询是否可执行：前置均未提交结果 -> ready=false，pending 按定义顺序
+curl -s localhost:8000/v1/dependencies/report:daily/ready
+# => {"task_key":"report:daily","ready":false,
+#     "pending":["extract:users","extract:orders"]}
+
+# 3. 前置任务正常走 申请租约 -> POST /v1/results/commit 提交结果后再次查询
+#    （结果不设 TTL，租约到期 / 释放不影响就绪判定）
+curl -s localhost:8000/v1/dependencies/report:daily/ready
+# => {"task_key":"report:daily","ready":true,"pending":[]}
+
+# 4. 没有依赖定义（或定义为空）的任务一律视为可执行
+curl -s localhost:8000/v1/dependencies/anything:new/ready
+# => {"task_key":"anything:new","ready":true,"pending":[]}
+
+# 5. 禁止自身依赖 -> 400
+curl -s -X POST localhost:8000/v1/dependencies/report:daily \
+  -H 'Content-Type: application/json' -d '{"dependencies": ["report:daily"]}'
+# => HTTP/1.1 400 Bad Request
+# {"detail":"task must not depend on itself"}
+# 去重后超过 16 个前置键同样返回 400。
+
+# 6. 环检测沿"现有定义"进行：已存在 A->B、B->C 时保存 C->A 会成环
+curl -s -X POST localhost:8000/v1/dependencies/dep:A \
+  -H 'Content-Type: application/json' -d '{"dependencies": ["dep:B"]}'
+curl -s -X POST localhost:8000/v1/dependencies/dep:B \
+  -H 'Content-Type: application/json' -d '{"dependencies": ["dep:C"]}'
+curl -i -X POST localhost:8000/v1/dependencies/dep:C \
+  -H 'Content-Type: application/json' -d '{"dependencies": ["dep:A"]}'
+# => HTTP/1.1 409 Conflict
+# {"task_key":"dep:C","dependencies":[],"reason":"cycle"}
+# 拒绝发生在任何写入之前：dep:C 没有定义（ready=true），其余定义不变。
+
+# 7. 依赖图过大（单次遍历超过 1024 个节点）同样拒绝，原定义保留
+# => HTTP/1.1 409 Conflict
+# {"task_key":"...","dependencies":["旧前置..."],"reason":"traversal_limit"}
+
+# 8. 菱形等汇聚结构不是环，可正常保存（多个前置共享同一后继）
+curl -s -X POST localhost:8000/v1/dependencies/dep:A2 \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies": ["dep:B2", "dep:C2", "dep:D2"]}'
+# => 200；B2/C2/D2 再共同依赖 dep:X2 也合法；
+#    但此时保存 X2 -> A2 会形成环并被 409 cycle 拒绝。
+```
+
+字段说明：
+
+| 字段 | 方向 | 说明 |
+| --- | --- | --- |
+| `dependencies` | 请求 / 响应 | 前置任务键列表（每个 1～512 字符）。请求按首次出现顺序去重，去重后最多 16 个，可为空数组；响应为生效中的去重定义（409 时为未改动的原定义） |
+| `ready` | 响应 | 所有前置任务均已提交持久结果（或任务没有依赖定义 / 定义为空）时为 `true` |
+| `pending` | 响应 | 尚未提交持久结果的前置任务键，按依赖定义顺序去重；`ready=true` 时为空 |
+| `reason` | 响应 | 仅 409 时返回：`cycle`（存在环，含自身依赖）/ `traversal_limit`（沿现有定义遍历节点超过上限） |
+
+- 任务键出现在路径中，可包含 `/` 等字符（与租约 / 结果接口一致采用 path 匹配）。
+- 环 / 超限拒绝为 **409** 且**不写入、不删除任何依赖定义**，响应 `dependencies`
+  回显当前旧定义；自身依赖 / 前置数量超限为请求参数问题，返回 **400**。
+- 依赖键**不设 TTL**，与租约 Hash、结果 Hash 共享 `LEASE_KEY_PREFIX` 前缀
+  （`:deps:` 命名空间），互不影响。
 
 ### 租约审计事件
 
@@ -431,6 +518,32 @@ curl -i -X POST localhost:8000/v1/limits/check \
   `result_conflict`（同序号内容冲突），所有尝试（含重放与拒绝）都在同一脚本内
   向该任务的审计 Stream 落一条 `result_commit` 事件。
 
+### 依赖门禁设计要点
+
+- **先检测后写入、拒绝保留原定义**：`POST /v1/dependencies/{task_key}` 由单个
+  Lua 脚本完成"沿**现有**依赖定义有向遍历 → 环 / 规模判定 → 整体替换"。
+  新集合在检测通过前不会写入，因此遍历读到的永远是旧图；一旦发现环或遍历节点
+  超限就在任何写入前返回（409，`cycle` / `traversal_limit`），原 List 原样保留。
+  写入采用"DEL 后 RPUSH 新集合"的整体替换，空数组即清空定义。
+- **环判定口径**：依赖图是"任务 → 前置任务集合"的有向图。保存 X 的前置集合 P
+  后成环，当且仅当从 P 中任一节点沿现有定义可到达 X——含 X 把自身列为前置
+  （API 层提前 400 拦截，Lua 内另有兜底）。脚本用带访问去重的 BFS 处理菱形等
+  汇聚结构，同一节点只访问一次。
+- **遍历节点上限**：单次保存最多沿现有定义访问
+  `DEPENDENCY_MAX_TRAVERSAL_NODES`（默认 1024）个**去重**节点（含候选前置
+  本身），超出即保守拒绝，避免在超大依赖图上单脚本执行过久；上限在每发现一个
+  新节点后检查，最后一层扩展出的节点同样计入。
+- **去重与数量上限**：请求列表在 API 层按首次出现顺序去重，去重后数量超过
+  `DEPENDENCY_MAX_PREREQUISITES`（默认 16）返回 400；保存的定义即去重后的
+  有序列表，`pending` 等读侧输出顺序稳定。
+- **就绪判定只认持久结果**：`GET .../ready` 对每个前置键检查结果 Hash
+  （`{prefix}:result:{task_key}`，由结果提交接口写入、无 TTL）是否存在；结果
+  存在即视为已完成，与该任务租约是否仍有效无关。检查通过一次 Redis 管道批量
+  `EXISTS` 完成。**没有依赖定义或定义为空的任务直接 `ready=true`**。
+- **键命名空间**：依赖存于 `{prefix}:deps:{task_key}` 的 Redis List（无 TTL），
+  与租约 Hash、防栅计数器、审计 Stream、结果 Hash 共用 `LEASE_KEY_PREFIX`
+  前缀而各自独立命名空间。
+
 ### 限流设计要点
 
 - **原子滑动窗口**：每次检查由单个 Lua 脚本依次完成
@@ -467,6 +580,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
 | `{prefix}:events:{task_key}` | Stream，条目含 `op` / `result` / `fencing` / `time_ms` / `batch_size`，`XADD MAXLEN` 裁剪 | 租约审计事件，按任务键分组，保留最新 `LEASE_EVENT_RETENTION` 条 |
 | `{prefix}:result:{task_key}` | Hash（`result` / `fencing` / `committed_at_ms`），**无 TTL** | 最近一次已提交任务结果及其防栅序号，不随租约到期删除 |
+| `{prefix}:deps:{task_key}` | List（去重保序的前置任务键），**无 TTL** | 任务的前置依赖定义；空 / 不存在表示无依赖，保存前经 Lua 环检测与 1024 节点遍历上限保护 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
 
@@ -498,7 +612,11 @@ limit 笔不超额**、参数校验和过期数据自动清理；以及 `request
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
 **20 个携带相同 request_id 的并发请求只扣减一次**、429 结果原样回放、
 `request_id` 跨窗口可再次使用、幂等作用域按 `client_key` 隔离、
-非法 `request_id` 返回 422。
+非法 `request_id` 返回 422；以及**任务依赖门禁**：保存去重保序与最多 16 个、
+自身依赖与超限 400、无定义视为可执行、依据持久结果的就绪判定（含租约过期不
+影响）、环检测（三节点环 / 菱形回边）拒绝 409 且保留原定义、拒绝后可正常改成
+无环集合、空数组清空，以及经 HTTP 构造 1024 节点链验证遍历上限：1025 节点
+409 `traversal_limit` 且保留原定义、恰好 1024 节点放行。
 
 ## 本地开发（不用 Docker）
 
@@ -513,10 +631,10 @@ uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  config.py    # 环境变量配置（pydantic-settings，含审计流保留条数）
-  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本
-  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果模型）
-  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取）
+  config.py    # 环境变量配置（pydantic-settings，含审计流保留条数、依赖数量 / 遍历上限）
+  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本 + 依赖保存（Lua 原子环检测 / 1024 节点遍历上限 / 拒绝保留原定义）脚本
+  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果、依赖门禁模型）
+  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取、依赖保存 / 就绪判定）
 scripts/
   smoke_test.py
 Dockerfile

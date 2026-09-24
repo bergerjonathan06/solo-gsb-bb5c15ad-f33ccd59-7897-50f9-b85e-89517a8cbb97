@@ -17,6 +17,10 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 仅有效租约凭据可写 / 相同内容重放 / 同序号不同内容 409 且不改结果 /
 旧持有者过期或被接管后无法覆盖 / 新租约可提交新结果 /
 结果不随租约到期删除 / 并发同内容恰好提交一次 / 提交尝试逐次落审计；
+以及任务依赖门禁：
+去重保序 / 自身依赖 400 / 最多 16 个 / 无定义视为可执行 /
+依据持久结果就绪判定 / 环检测拒绝且保留原定义 / 菱形无环 /
+空集合清空 / 遍历 1024 节点上限（超限拒绝并保留原定义）；
 以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
@@ -164,6 +168,7 @@ def main():
     renew_batch_checks()
     transfer_checks()
     result_checks()
+    dependency_checks()
     audit_checks()
     limit_checks()
 
@@ -799,6 +804,165 @@ def result_checks():
           and sum(1 for e in crc if e["result"] == "replayed") == 19
           and all(e["fencing_token"] == ca["fencing_token"] for e in crc),
           f"{[(e['result'], e['fencing_token']) for e in crc]}")
+
+
+def dependency_checks():
+    """/v1/dependencies：保存去重 / 自身依赖 / 环检测 / 遍历上限 / 拒绝保留原定义 /
+    就绪判定依据持久结果 / 无定义视为可执行 / 空集合清空。"""
+    base = f"smoke-deps:{int(time.time() * 1000)}"
+
+    def setd(k, deps):
+        return call("POST", f"/v1/dependencies/{k}", {"dependencies": deps})
+
+    def ready(k):
+        return call("GET", f"/v1/dependencies/{k}/ready")
+
+    def commit(k):
+        """申请租约并提交持久结果，供就绪判定使用。"""
+        code, a = call("POST", "/v1/leases/acquire",
+                       {"task_key": k, "ttl_ms": 30_000})
+        assert code == 200 and a["acquired"], f"{code} {a}"
+        code, c = call("POST", "/v1/results/commit",
+                       {"task_key": k, "token": a["token"],
+                        "fencing_token": a["fencing_token"], "result": {"ok": 1}})
+        assert code == 200 and c["committed"], f"{code} {c}"
+
+    # 1) 没有定义的任务视为可执行
+    code, r = ready(f"{base}:none")
+    check("deps undefined -> ready",
+          code == 200 and r["ready"] is True and r["pending"] == [],
+          f"{code} {r}")
+
+    # 2) 保存两个前置：去重保序返回
+    fk = f"{base}:final"
+    a1, a2 = f"{base}:a", f"{base}:b"
+    code, r = setd(fk, [a1, a2, a1, a2])
+    check("deps save dedup keep order",
+          code == 200 and r["dependencies"] == [a1, a2]
+          and r["reason"] is None, f"{code} {r}")
+
+    # 3) 前置均未提交结果 -> ready=false，pending 按定义顺序
+    code, r = ready(fk)
+    check("deps ready pending all",
+          code == 200 and r["ready"] is False and r["pending"] == [a1, a2],
+          f"{code} {r}")
+
+    # 4) 提交一个前置结果 -> pending 只剩另一个
+    commit(a1)
+    code, r = ready(fk)
+    check("deps ready one pending",
+          code == 200 and r["ready"] is False and r["pending"] == [a2],
+          f"{code} {r}")
+
+    # 5) 两个前置都提交 -> ready=true
+    commit(a2)
+    code, r = ready(fk)
+    check("deps ready all committed",
+          code == 200 and r["ready"] is True and r["pending"] == [],
+          f"{code} {r}")
+
+    # 6) 自身依赖 -> 400（路径键出现在去重后列表中，即便混在重复项里）
+    sk = f"{base}:self"
+    code, r = setd(sk, [a1, sk, sk])
+    check("deps self dependency -> 400",
+          code == 400 and "itself" in r.get("detail", ""), f"{code} {r}")
+
+    # 7) 空数组保存合法并清空定义；无定义 -> ready
+    code, r = setd(fk, [])
+    check("deps save empty clears",
+          code == 200 and r["dependencies"] == [], f"{code} {r}")
+    code, r = ready(fk)
+    check("deps cleared -> ready",
+          code == 200 and r["ready"] is True, f"{code} {r}")
+
+    # 8) 数量上限：去重后最多 16 个，17 个拒绝；16 个 + 重复合法
+    uniq = [f"{base}:k{i}" for i in range(17)]
+    code, _ = setd(f"{base}:big", uniq)
+    check("deps 17 unique -> 400", code == 400, f"code={code}")
+    code, _ = setd(f"{base}:big", uniq[:16])
+    check("deps exactly 16 -> 200", code == 200, f"code={code}")
+    code, _ = setd(f"{base}:big2", uniq[:16] + [uniq[0]])
+    check("deps 17 entries 16 unique -> 200", code == 200, f"code={code}")
+    code, r = ready(f"{base}:big2")
+    check("deps stored 16 unique pending",
+          code == 200 and len(r["pending"]) == 16, f"{code} {r}")
+
+    # 9) 环检测：A->B, B->C 后 C->A 成环，拒绝且 C 保留原定义（此处原无定义）
+    ka, kb, kc = f"{base}:A", f"{base}:B", f"{base}:C"
+    code, _ = setd(ka, [kb])
+    check("deps chain A->B", code == 200, f"code={code}")
+    code, _ = setd(kb, [kc])
+    check("deps chain B->C", code == 200, f"code={code}")
+    code, r = setd(kc, [ka])
+    check("deps 3-node cycle -> 409",
+          code == 409 and r["reason"] == "cycle"
+          and r["dependencies"] == [], f"{code} {r}")
+    code, rr = ready(kc)
+    check("deps cycle rejection leaves C undefined",
+          code == 200 and rr["ready"] is True, f"{code} {rr}")
+
+    # 10) 菱形无环（两个前置共享同一后继），且更新不相关叶子不影响判定
+    kx = f"{base}:X"
+    code, _ = setd(ka, [kb, kc, kx])
+    check("deps diamond A->B,C,X", code == 200, f"code={code}")
+    code, _ = setd(kb, [kx])
+    code, _ = setd(kc, [kx])
+    check("deps diamond B,C -> X ok", code == 200, f"code={code}")
+    # 此时 X->A 会成环（A 可经 B/C 到达 X），必须拒绝且 X 保持无定义
+    code, r = setd(kx, [ka])
+    check("deps diamond back edge -> 409 cycle",
+          code == 409 and r["reason"] == "cycle"
+          and r["dependencies"] == [], f"{code} {r}")
+
+    # 11) 拒绝时保留原定义：keep->[p1]，再保存会成环的集合 -> 409，
+    #     响应回显旧定义；之后改成无环集合成功
+    kp = f"{base}:keep"
+    p1, loop = f"{base}:p1", f"{base}:loop"
+    code, _ = setd(kp, [p1])
+    check("deps keep initial", code == 200, f"code={code}")
+    code, _ = setd(loop, [kp])
+    check("deps loop->keep", code == 200, f"code={code}")
+    code, r = setd(kp, [loop])
+    check("deps update cycle preserves old",
+          code == 409 and r["reason"] == "cycle"
+          and r["dependencies"] == [p1], f"{code} {r}")
+    code, rr = ready(kp)
+    check("deps old def still gates",
+          code == 200 and rr["ready"] is False and rr["pending"] == [p1],
+          f"{code} {rr}")
+    code, r = setd(kp, [f"{base}:p2"])
+    check("deps valid update after reject",
+          code == 200 and r["dependencies"] == [f"{base}:p2"], f"{code} {r}")
+
+    # 12) 就绪只看持久结果，与租约是否仍有效无关：结果不设 TTL
+    #     （a1 的租约早已可能过期，但其结果仍让依赖它的任务就绪）
+    code, _ = setd(f"{base}:persist", [a1])
+    code, r = ready(f"{base}:persist")
+    check("deps readiness uses persisted results only",
+          code == 200 and r["ready"] is True, f"{code} {r}")
+
+    # 13) 遍历上限：经 HTTP 构造 1024 个节点的链（每步保存只遍历既有链），
+    #     再让新任务依赖链尾：1025 个节点 -> 409 traversal_limit 且保留原定义；
+    #     恰好 1024 个节点 -> 200。
+    chain = f"{base}:chain"
+    for i in range(1, 1025):
+        code, body = setd(f"{chain}:{i}", [f"{chain}:{i - 1}"])
+        assert code == 200, f"chain i={i}: {code} {body}"
+    check("deps 1024-chain built", code == 200, f"last={code}")
+    code, r = setd(f"{chain}:over", [f"{chain}:1024"])
+    check("deps 1025 nodes -> 409 traversal_limit",
+          code == 409 and r["reason"] == "traversal_limit"
+          and r["dependencies"] == [], f"{code} {r}")
+    code, rr = ready(f"{chain}:over")
+    check("deps traversal rejection leaves undefined",
+          code == 200 and rr["ready"] is True, f"{code} {rr}")
+    code, _ = setd(f"{chain}:edge", [f"{chain}:1023"])
+    check("deps exactly 1024 nodes -> 200", code == 200, f"code={code}")
+    # 已有定义时再次超限更新：保留旧定义
+    code, r = setd(f"{chain}:edge", [f"{chain}:1024"])
+    check("deps over-limit update preserves old",
+          code == 409 and r["reason"] == "traversal_limit"
+          and r["dependencies"] == [f"{chain}:1023"], f"{code} {r}")
 
 
 def fetch_events(key, cursor=None, limit=None):

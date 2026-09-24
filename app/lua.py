@@ -33,6 +33,13 @@
   不重复扣减；窗口结束后 Hash 自动删除，request_id 可再次使用。
 - 窗口判断、累计、扣减与幂等判定全部基于 redis.call('TIME') 的
   服务器时间，单脚本原子执行，并发请求不会超额、不会重复扣减。
+
+任务依赖约定：
+- 依赖键（<prefix>:deps:<task_key>）是一个不带 TTL 的 List，
+  保存该任务去重后的前置任务键（按首次出现顺序）。
+- 保存依赖由单个 Lua 脚本完成：先沿**现有定义**做有向遍历检测环，
+  单次最多访问 1024（可配置）个节点；发现环或遍历超限时在任何写入前
+  返回，原定义原样保留；无环且未超限才整体替换旧定义。
 """
 
 # 租约审计公共函数：拼接到每个需要落账的租约脚本前。
@@ -544,4 +551,94 @@ if allowed == 1 then
   return {1, remaining, reset_at}
 end
 return {0, remaining, reset_at, retry_after}
+"""
+
+# 保存任务依赖（前置任务键集合）：环检测 + 遍历节点上限与写入在同一脚本内完成。
+#
+# 依赖图是"task -> 其前置任务集合"的有向图：新增/替换 X 的前置集合 P 后，
+# 当且仅当沿 P 中任一现有定义可到达 X 时会形成环（含 X 把自身列为前置）。
+# 检测从 P 中各节点出发沿**现有定义**做有向 BFS：
+#   - 遍历到 X           -> 存在环，拒绝；
+#   - 访问去重节点数超限 -> 图过大，拒绝（保守策略）；
+#   - 遍历正常结束       -> 无环，用新集合整体替换旧定义。
+# 任一拒绝路径都在任何写入之前返回，原定义（Redis List）原样保留。
+#
+# 依赖键是一个不带 TTL 的 Redis List：元素为去重后的前置任务键，
+# 按首次出现顺序保存（RPUSH），读取侧 LRANGE 即得稳定顺序。
+# 键名在脚本内按 <prefix>:deps:<task_key> 拼出，仅需把待写键 KEYS[1]
+# 显式传给 Redis；遍历访问到的其他键不声明在 KEYS 中（Redis Cluster
+# 单实例部署，与本服务既有脚本的部署假设一致）。
+#
+# KEYS[1]      = 目标任务的依赖键（<prefix>:deps:<task_key>）
+# ARGV[1]      = Redis 键前缀
+# ARGV[2]      = 目标任务键 task_key（环检测的回边目标）
+# ARGV[3]      = 去重后前置任务键数量 n
+# ARGV[4..n+3] = 去重后的前置任务键（按首次出现顺序，已保证不含 task_key）
+# ARGV[n+4]    = 单次遍历最多访问的节点数
+# 成功返回       {1}
+# 存在环返回     {0, 'cycle', 造成回边的前置任务键}
+# 超过遍历上限返回 {0, 'traversal_limit'}
+DEPENDENCY_SET_LUA = """
+local prefix = ARGV[1]
+local target = ARGV[2]
+local n = tonumber(ARGV[3])
+local max_nodes = tonumber(ARGV[n + 4])
+
+local function deps_key(k)
+  return prefix .. ':deps:' .. k
+end
+
+-- 从候选前置集合出发沿现有定义有向 BFS；新集合尚未写入，只读到旧图。
+-- visited 以任务键字符串为键（# 只对数组部分计数），节点数用 visited_n 显式累计。
+local visited = {}
+local frontier = {}
+local roots = {}
+local visited_n = 0
+for i = 1, n do
+  local dep = ARGV[i + 3]
+  if dep == target then
+    -- 自身依赖：候选集合直接包含目标（防御性兜底，正常由 API 层提前拒绝）
+    return {0, 'cycle', dep}
+  end
+  if not visited[dep] then
+    visited[dep] = true
+    visited_n = visited_n + 1
+    frontier[#frontier + 1] = dep
+    roots[dep] = dep
+  end
+end
+
+local head = 1
+while head <= #frontier do
+  local node = frontier[head]
+  head = head + 1
+  if node == target then
+    return {0, 'cycle', roots[node]}
+  end
+  local prereqs = redis.call('LRANGE', deps_key(node), 0, -1)
+  for _, next_node in ipairs(prereqs) do
+    if not visited[next_node] then
+      visited[next_node] = true
+      visited_n = visited_n + 1
+      frontier[#frontier + 1] = next_node
+      roots[next_node] = roots[node]
+    end
+  end
+  -- 在发现新节点之后检查：节点数上限覆盖整次遍历（含候选集合），
+  -- 避免最后一层扩展出的节点在队列排空时漏检
+  if visited_n > max_nodes then
+    return {0, 'traversal_limit'}
+  end
+end
+
+-- 无环且遍历规模在限制内：整体替换旧定义（空集合即删除定义键）
+redis.call('DEL', KEYS[1])
+if n > 0 then
+  local args = {'RPUSH', KEYS[1]}
+  for i = 1, n do
+    args[#args + 1] = ARGV[i + 3]
+  end
+  redis.call(unpack(args))
+end
+return {1}
 """
