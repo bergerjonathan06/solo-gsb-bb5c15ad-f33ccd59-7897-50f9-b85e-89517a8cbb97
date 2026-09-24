@@ -33,6 +33,18 @@
   不重复扣减；窗口结束后 Hash 自动删除，request_id 可再次使用。
 - 窗口判断、累计、扣减与幂等判定全部基于 redis.call('TIME') 的
   服务器时间，单脚本原子执行，并发请求不会超额、不会重复扣减。
+
+任务依赖约定：
+- 每个任务键的前置依赖定义是一个 Redis List：
+  {prefix}:deps:{task_key}，元素即前置任务键（请求顺序，已去重，
+  最多 16 个）；未定义（键不存在）表示该任务没有门禁、随时可执行。
+- 保存定义的环检测只遍历"现有"定义：从本次提交的每个前置键出发，
+  沿现有依赖边能否回到本任务键；去重后访问节点数上限 1024。
+  发现环或访问超限即拒绝，且发生在任何写入之前，原定义原样保留；
+  通过后 DEL + RPUSH 原子替换（空列表即删除定义）。
+- 就绪判定（GET ready）只检查直接前置任务键是否已提交持久结果
+  （{prefix}:result:{task_key} 是否存在）：全部存在则 ready=true，
+  否则 ready=false 并返回未完成的前置键；结果不设 TTL，提交即完成。
 """
 
 # 租约审计公共函数：拼接到每个需要落账的租约脚本前。
@@ -451,6 +463,91 @@ audit_add(KEYS[3], retention,
   {'op', 'result_commit', 'result', 'committed',
    'fencing', ARGV[2], 'time_ms', tostring(now)})
 return {1, 'committed', tonumber(ARGV[2]), now}
+"""
+
+# 保存任务依赖定义：先按"现有定义"做环检测，再整体替换，全成全败。
+# 依赖定义是一个 Redis List（每项为一个前置任务键，顺序即请求顺序）：
+#   {prefix}:deps:{task_key}
+# 环检测只遍历当前已持久化的依赖定义（不把本次待写入的定义计入），
+# 从本次提交的每个前置任务键出发，沿"前置 -> 前置"方向深度遍历：
+#   - 一旦沿当前路径回到起点 task_key，说明写入后将成环 -> 拒绝；
+#   - 去重后访问节点数超过 1024 -> 拒绝（遍历上界，防止大图拖垮脚本）。
+# 环 / 超限均发生在任何写入之前：拒绝时原有依赖定义原样保留；
+# 全部通过后再 DEL + RPUSH 原子替换为新定义（空列表即删除定义）。
+# 脚本只允许声明自身依赖键（KEYS[1]），遍历中读取的其他依赖键通过
+# 前缀在服务端拼出（{prefix}:deps:{task_key}），不改变现有键布局约定。
+# KEYS[1] = 本任务依赖定义键
+# ARGV[1] = 依赖键前缀（形如 "<prefix>:deps:"）
+# ARGV[2] = 本任务键 task_key
+# ARGV[3] = 前置任务数 m（已在服务端去重，m <= 16）
+# ARGV[4..m+3] = 去重后的前置任务键（请求顺序）
+# 成功返回   {1}
+# 环拒绝返回 {0, 'cycle'}
+# 超限拒绝返回 {0, 'too_many_nodes'}
+DEPENDENCY_SET_LUA = """
+local prefix = ARGV[1]
+local target = ARGV[2]
+local m = tonumber(ARGV[3])
+local MAX_NODES = 1024
+
+local visited = {}
+local count = 0
+
+-- 从起点 dep 出发沿现有定义遍历，返回是否能到达 target（成环）。
+-- visited / count 在多个起点间共享：同一节点只计一次、只走一次。
+local function reaches_target(dep)
+  local stack = {dep}
+  while #stack > 0 do
+    local node = table.remove(stack)
+    if node == target then
+      return true
+    end
+    if not visited[node] then
+      -- 严格上限：在访问（标记 + 读取）第 1025 个节点之前判定超限，
+      -- 保证单次环检测最多只访问 1024 个现有节点。
+      if count >= MAX_NODES then
+        return false, true
+      end
+      visited[node] = true
+      count = count + 1
+      local prereqs = redis.call('LRANGE', prefix .. node, 0, -1)
+      for _, p in ipairs(prereqs) do
+        if p == target then
+          return true
+        end
+        if not visited[p] then
+          stack[#stack + 1] = p
+        end
+      end
+    end
+  end
+  return false, false
+end
+
+for i = 1, m do
+  local dep = ARGV[i + 3]
+  if dep == target then
+    return {0, 'cycle'}     -- 自身依赖：直接成环（防御性检查，服务端已先拒绝）
+  end
+  local cyclic, overflow = reaches_target(dep)
+  if cyclic then
+    return {0, 'cycle'}
+  end
+  if overflow then
+    return {0, 'too_many_nodes'}
+  end
+end
+
+-- 检测通过（且未做任何写入）：原子替换为新定义；空列表即清除定义
+redis.call('DEL', KEYS[1])
+if m > 0 then
+  local args = {}
+  for i = 1, m do
+    args[i] = ARGV[i + 3]
+  end
+  redis.call('RPUSH', KEYS[1], unpack(args))
+end
+return {1}
 """
 
 # 滑动窗口限流（成本累计）+ 可选请求幂等：单脚本原子完成

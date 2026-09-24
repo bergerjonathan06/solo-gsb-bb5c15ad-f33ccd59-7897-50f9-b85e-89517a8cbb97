@@ -32,6 +32,16 @@
 提交并覆盖为新结果。`GET /v1/results/{task_key}` 返回最近一次已提交结果及其防栅
 序号；**结果不设 TTL，不随租约到期删除**。
 
+还提供**任务依赖门禁 API**：`POST /v1/dependencies/{task_key}` 整体保存一个任务
+的前置任务键（按首次出现顺序**去重**、最多 **16** 个，空列表清除定义），
+**禁止自身依赖**；环检测在 **Redis Lua** 中先遍历**现有**依赖定义，从每个前置键
+出发判断能否回到本任务键，**单次最多访问 1024 个节点**，发现环或访问超限即拒绝
+（`409`）且**保留原定义**，通过后再原子替换。
+`GET /v1/dependencies/{task_key}/ready` 依据**现有持久任务结果**（即
+`/v1/results` 的无 TTL 结果键）判断所有直接前置任务是否都已提交，返回 `ready`
+与尚未完成的键列表 `pending`；**没有定义的任务视为可执行**。依赖键沿用租约 /
+结果的 `LEASE_KEY_PREFIX` 前缀（`:deps:` 命名空间）。
+
 技术栈：Python 3.12 · FastAPI · Redis 7（Lua 脚本保证原子性）
 
 ## 快速开始（一条命令）
@@ -87,6 +97,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
 | POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409 |
 | GET | `/v1/results/{task_key}` | 读取最近一次已提交结果及防栅序号（持久保留，不随租约到期删除） |
+| POST | `/v1/dependencies/{task_key}` | 保存前置依赖定义（去重、最多 16 个，空列表清除），Lua 遍历现有定义检测环、单次最多访问 1024 个节点，成环 / 超限 409 且保留原定义；自身依赖 422 |
+| GET | `/v1/dependencies/{task_key}/ready` | 门禁判定：所有直接前置任务均已提交持久结果则 `ready=true`，否则返回未完成键 `pending`；无定义视为可执行 |
 | POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减，可选 `request_id` 幂等），放行 200 / 超限 429 |
 | GET | `/healthz` | 健康检查 |
 
@@ -245,6 +257,79 @@ curl -s localhost:8000/v1/results/report:daily
 | `replayed` | 响应 | 同一防栅序号已提交且内容一致时为 `true`，响应头同时带 `Result-Replay: true`；不刷新 `committed_at_ms` |
 | `committed_at_ms` | 响应 | 结果首次提交时刻（Redis 服务器时钟，Unix 毫秒），重放 / 覆盖语义见上 |
 | `reason` | 响应 | 仅 409 时返回：`not_found` / `conflict` / `expired` / `result_conflict` |
+
+### 任务依赖门禁
+
+为任务声明一组**前置任务键**，只有所有直接前置任务都已提交持久结果时，该任务才
+"就绪可执行"。依赖定义保存在 Redis List（`{prefix}:deps:{task_key}`，沿用
+`LEASE_KEY_PREFIX` 前缀），环检测由单个 Lua 脚本原子完成。
+
+```bash
+# 1. 保存 task-c 的前置任务（整体替换）。服务端按首次出现顺序去重，最多 16 个
+curl -s -X POST localhost:8000/v1/dependencies/task-c \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies": ["task-a", "task-b"]}'
+# => 200 {"saved":true,"task_key":"task-c","dependencies":["task-a","task-b"],"reason":null}
+
+# 2. 查询门禁：task-a / task-b 尚未提交结果 -> ready=false，pending 给出未完成键
+curl -s localhost:8000/v1/dependencies/task-c/ready
+# => {"task_key":"task-c","ready":false,"pending":["task-a","task-b"]}
+
+# 3. 前置任务通过 /v1/results/commit 提交结果后（结果持久保留，提交即"完成"）
+#    门禁自动就绪，无需额外确认：
+curl -s localhost:8000/v1/dependencies/task-c/ready
+# => {"task_key":"task-c","ready":true,"pending":[]}
+
+# 4. 没有定义的任务视为可执行
+curl -s localhost:8000/v1/dependencies/never-defined/ready
+# => {"task_key":"never-defined","ready":true,"pending":[]}
+
+# 5. 重复键服务端去重；原始 17 个但去重后 16 个仍可保存；去重后超过 16 个 -> 422
+curl -s -X POST localhost:8000/v1/dependencies/task-c \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies": ["task-a", "task-b", "task-a"]}'
+# => 200，dependencies 为 ["task-a","task-b"]
+
+# 6. 自身依赖 -> 422
+curl -s -X POST localhost:8000/v1/dependencies/task-c \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies": ["task-c"]}'
+# => 422 {"detail":"task must not depend on itself"}
+
+# 7. 成环或遍历超限 -> 409，且原定义原样保留（响应回带当前生效定义）
+#    现有 task-c -> [task-a]，再让 task-a -> task-c 会形成 c->a->c：
+curl -s -X POST localhost:8000/v1/dependencies/task-a \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies": ["task-c"]}'
+# => 409 {"saved":false,"task_key":"task-a","dependencies":[],
+#         "reason":"cycle"}
+#    单次环检测去重后最多访问 1024 个现有节点，超过返回：
+#    {"saved":false,...,"reason":"too_many_nodes"}（同样不改动原定义）
+
+# 8. 空列表清除定义（之后该任务视为无门禁、可执行）
+curl -s -X POST localhost:8000/v1/dependencies/task-c \
+  -H 'Content-Type: application/json' -d '{"dependencies": []}'
+# => 200 {"saved":true,...,"dependencies":[]}
+```
+
+字段与规则说明：
+
+| 字段 / 规则 | 方向 | 说明 |
+| --- | --- | --- |
+| `dependencies` | 请求 | 前置任务键列表（每个 1～512 字符）；服务端按首次出现顺序**去重**，去重后最多 **16** 个，否则 `422`；空列表表示**清除**定义 |
+| `task_key`（路径） | 请求 | 目标任务键；出现在 `dependencies` 中即自身依赖，返回 `422` 且不触达 Redis |
+| `saved` | 响应 | 定义是否已整体替换；被环 / 遍历上限拒绝时为 `false`（HTTP 409） |
+| `dependencies` | 响应 | 成功时为本次写入（去重后、按请求顺序）；409 时回带**当前仍生效的旧定义**（无定义为空列表） |
+| `reason` | 响应 | 仅 409 时返回：`cycle`（写入后将形成依赖环，含自身依赖的 Lua 兜底）/ `too_many_nodes`（环检测去重访问节点数超过 **1024**） |
+| `ready` | 响应 | 全部直接前置任务均已提交持久结果为 `true`；**无定义任务恒为 `true`** |
+| `pending` | 响应 | 尚未提交结果的直接前置任务键（按依赖定义顺序）；就绪时为空列表 |
+
+环检测语义：保存 `T -> [d...]` 前，Lua 从每个 `d` 出发，沿**当前已持久化**的
+依赖边（只看现有定义，不含本次待写入内容）判断是否能回到 `T`；能回到 `T` 则
+本次写入必成环，拒绝。跨多个起点的遍历共享去重访问集合，**去重后访问节点数以
+1024 为硬上限**，达到即判 `too_many_nodes` 拒绝。环与超限都发生在任何写入之前，
+因此被拒时原有依赖定义**一字不改**；只有全部检查通过后才在同一脚本内
+`DEL + RPUSH` 原子替换。
 
 ### 租约审计事件
 
@@ -431,6 +516,30 @@ curl -i -X POST localhost:8000/v1/limits/check \
   `result_conflict`（同序号内容冲突），所有尝试（含重放与拒绝）都在同一脚本内
   向该任务的审计 Stream 落一条 `result_commit` 事件。
 
+### 任务依赖门禁设计要点
+
+- **保存：去重 + 16 上限 + 禁止自身依赖**：`POST /v1/dependencies/{task_key}`
+  对请求列表按首次出现顺序去重，去重后最多 16 个前置键（超限 `422`）；任务键
+  出现在依赖中即自身依赖，返回 `422`。定义存为 Redis List
+  `{prefix}:deps:{task_key}`，整体替换语义；空列表即 `DEL` 清除。
+- **环检测只遍历"现有"定义**：保存 `T -> [d...]` 时，Lua 从每个前置键 `d`
+  出发沿**当前已落库**的依赖边做可达性判断——若能回到 `T`，写入后必成环
+  （`cycle`，409）。检测全程在单个 Lua 脚本内、在任何写入之前完成，因此"检测 →
+  拒绝"不会与并发的其它保存产生半写状态；通过后才在同一脚本内 `DEL + RPUSH`
+  原子替换。
+- **1024 节点硬上限，拒绝保留原定义**：跨多个前置起点共享同一"去重访问集合"，
+  去重后访问的现有节点数最多 **1024**，超过即判 `too_many_nodes`（409）并立刻
+  停止。环与超限都在写入前返回，被拒时旧定义**原样保留**，响应体 `dependencies`
+  回带当前生效定义，便于调用方核对。
+- **ready 只看直接前置的持久结果**：`GET .../ready` 读取本任务的依赖 List，
+  逐个检查对应结果键 `{prefix}:result:{dep}` 是否存在（与
+  `GET /v1/results/{task_key}` 同源；结果无 TTL，提交即"已完成"）。
+  全部存在 -> `ready=true`；否则 `ready=false` 且 `pending` 按定义顺序列出
+  未完成键。判定**不递归**间接依赖，且**没有定义的任务恒为可执行**。
+- **沿用现有前缀**：依赖定义与租约 Hash、防栅计数器、审计 Stream、结果 Hash
+  共享 `LEASE_KEY_PREFIX`，独立使用 `:deps:` 命名空间，互不影响；环检测在 Lua
+  内以前缀拼出相邻依赖键读取，无需把全图键都声明进 `KEYS`。
+
 ### 限流设计要点
 
 - **原子滑动窗口**：每次检查由单个 Lua 脚本依次完成
@@ -467,6 +576,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
 | `{prefix}:events:{task_key}` | Stream，条目含 `op` / `result` / `fencing` / `time_ms` / `batch_size`，`XADD MAXLEN` 裁剪 | 租约审计事件，按任务键分组，保留最新 `LEASE_EVENT_RETENTION` 条 |
 | `{prefix}:result:{task_key}` | Hash（`result` / `fencing` / `committed_at_ms`），**无 TTL** | 最近一次已提交任务结果及其防栅序号，不随租约到期删除 |
+| `{prefix}:deps:{task_key}` | List（元素为前置任务键，去重、最多 16 个，按请求顺序；键不存在即无定义） | 任务依赖门禁定义；保存前 Lua 沿现有 List 做环检测（去重访问 ≤1024），拒绝保留原定义 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
 
@@ -498,7 +608,11 @@ limit 笔不超额**、参数校验和过期数据自动清理；以及 `request
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
 **20 个携带相同 request_id 的并发请求只扣减一次**、429 结果原样回放、
 `request_id` 跨窗口可再次使用、幂等作用域按 `client_key` 隔离、
-非法 `request_id` 返回 422。
+非法 `request_id` 返回 422；以及**任务依赖门禁**：无定义即可执行、
+保存按首次出现顺序去重且去重后限 16 个、自身依赖 422、
+环检测只遍历现有定义（成环 409 `cycle`）、单次去重访问节点上限 1024
+（超限 409 `too_many_nodes`）且环 / 超限都保留原定义、空列表清除定义、
+ready 依据持久任务结果判定直接前置并按顺序返回未完成键。
 
 ## 本地开发（不用 Docker）
 
@@ -514,9 +628,9 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings，含审计流保留条数）
-  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本
-  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果模型）
-  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取）
+  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本 + 依赖保存（现有定义环检测 / 1024 节点上限）Lua 脚本
+  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果模型、任务依赖门禁模型）
+  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取、依赖保存 / ready 门禁）
 scripts/
   smoke_test.py
 Dockerfile

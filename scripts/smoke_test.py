@@ -21,7 +21,12 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
 重试回放不重复扣减 / 并发相同 request_id 只扣一次 / 429 结果回放 /
-request_id 跨窗口可复用 / 非法 request_id 拒绝。
+request_id 跨窗口可复用 / 非法 request_id 拒绝；
+以及任务依赖门禁：
+无定义即可执行 / 保存去重且限 16 个 / 自身依赖 422 /
+环检测只遍历现有定义且拒绝时保留原定义 / 空列表清除 /
+ready 依据持久任务结果判定全部直接前置并返回未完成键 /
+环检测单次访问节点上限 1024（超限拒绝且保留原定义，恰好 1024 放行）。
 """
 import json
 import sys
@@ -166,6 +171,7 @@ def main():
     result_checks()
     audit_checks()
     limit_checks()
+    dependency_checks()
 
     print()
     if FAILED:
@@ -1231,6 +1237,199 @@ def idempotency_checks():
           x1["allowed"] and y1["allowed"]
           and x1["idempotent_replay"] is False
           and y1["idempotent_replay"] is False, f"{x1} {y1}")
+
+
+def set_dependencies(k, deps):
+    return call("POST", f"/v1/dependencies/{k}", {"dependencies": deps})
+
+
+def dependencies_ready(k):
+    return call("GET", f"/v1/dependencies/{k}/ready")
+
+
+def commit_task_result(k, result):
+    """申请短租约并提交持久结果，返回 (http_code, commit_body)。"""
+    code, a = call("POST", "/v1/leases/acquire", {"task_key": k, "ttl_ms": 60_000})
+    if code != 200 or not a.get("acquired"):
+        return code, a
+    return call(
+        "POST",
+        "/v1/results/commit",
+        {"task_key": k, "token": a["token"],
+         "fencing_token": a["fencing_token"], "result": result},
+    )
+
+
+def build_fan_subtree(tag, l3_parent_count):
+    """构造一棵 16 叉扇出依赖树（不设置根定义），返回根应依赖的 16 个 l1 键。
+
+    结构：16 个 l1，每个 l1 依赖 16 个 l2（共 256 个 l2），
+    前 l3_parent_count 个 l2 各依赖 16 个 l3。
+    从 16 个 l1 出发去重遍历的节点数 = 16 + 256 + 16*l3_parent_count：
+      l3_parent_count=47 -> 1024（恰好放行）；=48 -> 1040（超过 1024 拒绝）。
+    """
+    l1 = [f"{tag}:l1:{i}" for i in range(16)]
+    l2_flat = [f"{tag}:l2:{i}:{j}" for i in range(16) for j in range(16)]
+    l2_by_i = [l2_flat[i * 16:(i + 1) * 16] for i in range(16)]
+
+    def put(mapping):
+        key, deps = mapping
+        return set_dependencies(key, deps)
+
+    # 每个 l1 -> 16 个 l2（16 个请求并发）
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(put, zip(l1, l2_by_i)))
+    # 前 l3_parent_count 个 l2 -> 16 个 l3（并发）
+    packs = [
+        (l2_flat[p], [f"{l2_flat[p]}:l3:{j}" for j in range(16)])
+        for p in range(l3_parent_count)
+    ]
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(put, packs))
+    return l1
+
+
+def dependency_checks():
+    """/v1/dependencies：保存去重 / 自身依赖 / 环检测 / 1024 上限 / ready 判定。"""
+    base = f"smoke-deps:{int(time.time() * 1000)}"
+    A, B, C, D, E = [f"{base}:{x}" for x in "ABCDE"]
+
+    # 没有定义的任务视为可执行
+    code, b = dependencies_ready(A)
+    check("deps undefined task ready",
+          code == 200 and b["ready"] is True and b["pending"] == []
+          and b["task_key"] == A, f"{code} {b}")
+
+    # 保存 A -> [B, C]：200、回显顺序
+    code, b = set_dependencies(A, [B, C])
+    check("deps save ok",
+          code == 200 and b["saved"] is True
+          and b["dependencies"] == [B, C] and b["reason"] is None, f"{code} {b}")
+
+    # 前置均未提交结果 -> ready=false，pending 按定义顺序
+    code, b = dependencies_ready(A)
+    check("deps not ready pending all",
+          code == 200 and b["ready"] is False and b["pending"] == [B, C],
+          f"{code} {b}")
+
+    # 保存时按首次出现顺序去重（重复不报错，去重后落库）
+    code, b = set_dependencies(A, [B, C, B, C, B])
+    check("deps dedup on save",
+          code == 200 and b["saved"] and b["dependencies"] == [B, C],
+          f"{code} {b}")
+
+    # 自身依赖 -> 422（不触达 Redis；单独自身 / 混在列表中都拒绝）
+    code, _ = set_dependencies(A, [A])
+    check("deps self only -> 422", code == 422, f"code={code}")
+    code, _ = set_dependencies(A, [B, A])
+    check("deps self mixed -> 422", code == 422, f"code={code}")
+
+    # 去重后超过 16 个唯一键 -> 422；原始 17 个但去重后 16 -> 200
+    code, _ = set_dependencies(A, [f"{base}:u{i}" for i in range(17)])
+    check("deps 17 unique -> 422", code == 422, f"code={code}")
+    code, b = set_dependencies(A, [B, B] + [f"{base}:v{i}" for i in range(15)])
+    check("deps 17 raw dedupe-to-16 -> 200",
+          code == 200 and len(b["dependencies"]) == 16, f"{code} {b}")
+    set_dependencies(A, [B, C])
+
+    # 提交 B 的持久结果 -> pending 只剩 C；再提交 C -> ready=true
+    code, cb = commit_task_result(B, {"v": 1})
+    check("deps setup commit B", code == 200 and cb["committed"], f"{code} {cb}")
+    code, b = dependencies_ready(A)
+    check("deps one committed pending C",
+          code == 200 and b["ready"] is False and b["pending"] == [C],
+          f"{code} {b}")
+    code, cc = commit_task_result(C, {"v": 2})
+    check("deps setup commit C", code == 200 and cc["committed"], f"{code} {cc}")
+    code, b = dependencies_ready(A)
+    check("deps all committed ready",
+          code == 200 and b["ready"] is True and b["pending"] == [], f"{code} {b}")
+    # 与 GET /v1/results 同源：结果持久保留即视为已完成
+    code, g = call("GET", f"/v1/results/{C}")
+    check("deps ready uses persistent result",
+          code == 200 and g["committed"] and g["result"] == {"v": 2}, f"{code} {g}")
+
+    # 环检测只遍历现有定义，且拒绝时保留原定义
+    # B 当前无定义：B -> A 会形成 A->B->A（A 现有 [B,C]）-> 409 cycle，B 仍无定义
+    code, b = set_dependencies(B, [A])
+    check("deps cycle B->A rejected",
+          code == 409 and b["saved"] is False and b["reason"] == "cycle"
+          and b["dependencies"] == [], f"{code} {b}")
+    code, b = dependencies_ready(B)
+    check("deps rejected B stays executable",
+          code == 200 and b["ready"] is True, f"{code} {b}")
+
+    # B -> D 合法；随后 D -> A：现有 A->B->D，dep=A 能到 target=D -> 409，D 仍无定义
+    code, b = set_dependencies(B, [D])
+    check("deps B->D ok", code == 200 and b["saved"], f"{code} {b}")
+    code, b = set_dependencies(D, [A])
+    check("deps D->A cycle rejected",
+          code == 409 and b["reason"] == "cycle" and b["dependencies"] == [],
+          f"{code} {b}")
+    code, b = dependencies_ready(D)
+    check("deps D stays ready after cycle reject",
+          code == 200 and b["ready"] is True, f"{code} {b}")
+
+    # E -> B 合法（B 现有走到 D 为死路，回不到 E）；
+    # 再把 B 改成 [D, E]：dep=E 沿现有 E->B 回到 target=B -> 409，B 保留旧定义 [D]
+    code, b = set_dependencies(E, [B])
+    check("deps E->B ok", code == 200 and b["saved"], f"{code} {b}")
+    code, b = set_dependencies(B, [D, E])
+    check("deps B->E->B cycle rejected keeps old",
+          code == 409 and b["reason"] == "cycle"
+          and b["dependencies"] == [D], f"{code} {b}")
+    # 再来一次仍 409 且回读旧定义
+    code, b = set_dependencies(B, [E])
+    check("deps repeat cycle reject keeps [D]",
+          code == 409 and b["dependencies"] == [D], f"{code} {b}")
+
+    # 合法整体替换生效；空列表清除定义，清除后视为可执行且键被删除
+    code, b = set_dependencies(B, [C])
+    check("deps replace ok", code == 200 and b["dependencies"] == [C], f"{code} {b}")
+    code, b = set_dependencies(B, [])
+    check("deps clear ok",
+          code == 200 and b["saved"] and b["dependencies"] == [], f"{code} {b}")
+    code, b = dependencies_ready(B)
+    check("deps cleared task ready",
+          code == 200 and b["ready"] is True and b["pending"] == [], f"{code} {b}")
+
+    # pending 顺序与定义一致：A -> [C, B, D]，B/C 已完成，仅 D 未完成
+    code, _ = set_dependencies(A, [C, B, D])
+    code, b = dependencies_ready(A)
+    check("deps pending order",
+          code == 200 and b["ready"] is False and b["pending"] == [D],
+          f"{code} {b}")
+    code, _ = commit_task_result(D, {"v": 3})
+    code, b = dependencies_ready(A)
+    check("deps last prereq completes ready",
+          code == 200 and b["ready"] is True and b["pending"] == [], f"{code} {b}")
+
+    # 环检测单次访问节点上限 1024（纯 API 扇出构造，不直连 Redis）
+    # 放行边界：恰好访问 1024 个现有节点 -> 200
+    tag_ok = f"{base}:fan-ok"
+    l1_ok = build_fan_subtree(tag_ok, 47)
+    root_ok = f"{tag_ok}:root"
+    code, b = set_dependencies(root_ok, l1_ok)
+    check("deps cycle-scan exactly 1024 nodes accepted",
+          code == 200 and b["saved"] and b["dependencies"] == l1_ok, f"{code} {b}")
+
+    # 超限：访问 1040 个节点 -> 409 too_many_nodes，且保留原定义 [sentinel]
+    tag_bad = f"{base}:fan-bad"
+    l1_bad = build_fan_subtree(tag_bad, 48)
+    root_bad = f"{tag_bad}:root"
+    sentinel = f"{tag_bad}:sentinel"
+    code, _ = set_dependencies(root_bad, [sentinel])
+    check("deps overflow pre-set old def", code == 200, f"code={code}")
+    code, b = set_dependencies(root_bad, l1_bad)
+    check("deps cycle-scan 1040 nodes -> 409 too_many_nodes",
+          code == 409 and b["saved"] is False
+          and b["reason"] == "too_many_nodes" and b["dependencies"] == [sentinel],
+          f"{code} {b}")
+    # 原定义仍生效：ready 只看 sentinel（未提交）-> pending [sentinel]
+    code, b = dependencies_ready(root_bad)
+    check("deps overflow old definition still active",
+          code == 200 and b["ready"] is False and b["pending"] == [sentinel],
+          f"{code} {b}")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from .config import Settings, get_settings
 from .lua import (
     ACQUIRE_BATCH_LUA,
     ACQUIRE_LUA,
+    DEPENDENCY_SET_LUA,
     LIMIT_CHECK_LUA,
     RELEASE_LUA,
     RENEW_BATCH_LUA,
@@ -38,6 +39,9 @@ from .schemas import (
     AcquiredLease,
     AcquireRequest,
     AcquireResponse,
+    DependencyReadyResponse,
+    DependencySetRequest,
+    DependencySetResponse,
     LeaseEvent,
     LeaseEventPage,
     LeaseStateResponse,
@@ -78,6 +82,7 @@ async def lifespan(app: FastAPI):
         validate=redis.register_script(VALIDATE_LUA),
         result_commit=redis.register_script(RESULT_COMMIT_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
+        dependency_set=redis.register_script(DEPENDENCY_SET_LUA),
     )
     yield
     await redis.aclose()
@@ -85,11 +90,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "供多个工作进程协调独占任务的租约服务、基于 Redis Lua 的"
-        "原子滑动窗口成本限流，以及租约凭据保护的任务结果提交"
-        "（FastAPI + Redis Lua）"
+        "原子滑动窗口成本限流，租约凭据保护的任务结果提交，"
+        "以及基于持久任务结果的前置依赖门禁（FastAPI + Redis Lua）"
     ),
     lifespan=lifespan,
 )
@@ -131,6 +136,11 @@ def event_stream_key(settings: Settings, task_key: str) -> str:
 def result_key(settings: Settings, task_key: str) -> str:
     # 结果持久保留（无 TTL），与租约 Hash / 事件流共享前缀、独立命名空间
     return f"{settings.key_prefix}:result:{task_key}"
+
+
+def dependency_key(settings: Settings, task_key: str) -> str:
+    # 前置依赖定义（Redis List），与结果 / 租约共享前缀、独立命名空间
+    return f"{settings.key_prefix}:deps:{task_key}"
 
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
@@ -627,6 +637,100 @@ async def get_result(
         fencing_token=int(data["fencing"]),
         result=json.loads(data["result"]),
         committed_at_ms=int(data["committed_at_ms"]),
+    )
+
+
+@app.post(
+    "/v1/dependencies/{task_key:path}",
+    response_model=DependencySetResponse,
+    tags=["dependencies"],
+    summary="保存任务前置依赖定义（去重、限 16 个，Lua 环检测，拒绝时保留原定义）",
+    responses={
+        status.HTTP_409_CONFLICT: {"model": DependencySetResponse},
+    },
+)
+async def set_dependencies(
+    task_key: str,
+    req: DependencySetRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    redis: RedisDep,
+    settings: SettingsDep,
+) -> DependencySetResponse:
+    """整体替换任务的前置任务键列表（空列表表示清除定义）。
+
+    - 前置键由请求模型按首次出现顺序**去重**，去重后最多 **16** 个；
+      去重后仍超限返回 **422**。包含任务自身（自身依赖）返回 **422**，
+      不触达 Redis。
+    - 环检测在**单个 Redis Lua 脚本**内基于**现有已持久化定义**完成：
+      从每个前置键出发沿现有依赖边遍历，若能回到 `task_key` 则写入后必成环，
+      返回 **409** `reason=cycle`；去重后访问节点数超过 **1024** 立即停止，
+      返回 **409** `reason=too_many_nodes`。
+    - 环 / 超限都发生在任何写入之前，被拒时**原定义原样保留**，
+      响应体 `dependencies` 回带当前仍生效的定义。
+    - 检测通过后在同一脚本内 `DEL + RPUSH` 原子替换为新定义。
+    """
+    # 请求模型已按首次出现顺序去重；这里再兜底一次，并检查自身依赖
+    deps = list(dict.fromkeys(req.dependencies))
+    if task_key in deps:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="task must not depend on itself",
+        )
+
+    dkey = dependency_key(settings, task_key)
+    result = await scripts.dependency_set(
+        keys=[dkey],
+        args=[
+            f"{settings.key_prefix}:deps:",
+            task_key,
+            str(len(deps)),
+            *deps,
+        ],
+    )
+    # 成功返回 [1]；拒绝返回 [0, reason]
+    if not result[0]:
+        # 被拒：回读当前定义（未做任何写入，即原定义），便于客户端核对
+        current = await redis.lrange(dkey, 0, -1)
+        response.status_code = status.HTTP_409_CONFLICT
+        return DependencySetResponse(
+            saved=False, task_key=task_key, dependencies=current,
+            reason=result[1],
+        )
+    return DependencySetResponse(
+        saved=True, task_key=task_key, dependencies=deps
+    )
+
+
+@app.get(
+    "/v1/dependencies/{task_key:path}/ready",
+    response_model=DependencyReadyResponse,
+    tags=["dependencies"],
+    summary="查询任务门禁是否就绪（所有直接前置任务均已提交持久结果）",
+)
+async def dependencies_ready(
+    task_key: str, redis: RedisDep, settings: SettingsDep
+) -> DependencyReadyResponse:
+    """依据持久任务结果判断所有**直接**前置任务是否均已提交。
+
+    - 读取该任务的依赖定义（`{prefix}:deps:{task_key}` List）；
+      **没有定义（键不存在）的任务视为可执行**，返回 `ready=true`。
+    - 逐个检查前置任务的持久结果键（`{prefix}:result:{task_key}`，
+      与 `GET /v1/results/{task_key}` 同源；结果不设 TTL，提交即完成）。
+    - 全部前置均已提交结果时 `ready=true`；否则 `ready=false`，
+      `pending` 按依赖定义顺序给出尚未完成（未提交结果）的前置键。
+    """
+    deps = await redis.lrange(dependency_key(settings, task_key), 0, -1)
+    if not deps:
+        return DependencyReadyResponse(task_key=task_key, ready=True, pending=[])
+
+    async with redis.pipeline(transaction=False) as pipe:
+        for dep in deps:
+            pipe.exists(result_key(settings, dep))
+        exists_flags = await pipe.execute()
+    pending = [dep for dep, flag in zip(deps, exists_flags) if not flag]
+    return DependencyReadyResponse(
+        task_key=task_key, ready=not pending, pending=pending
     )
 
 

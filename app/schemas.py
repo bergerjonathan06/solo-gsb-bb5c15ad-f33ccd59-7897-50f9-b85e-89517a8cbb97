@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 BATCH_MIN_SIZE = 2
 BATCH_MAX_SIZE = 32
 
+# 单个任务允许声明的前置任务键上限（保存前去重）
+DEPENDENCY_MAX_COUNT = 16
+
 TaskKey = Annotated[str, Field(min_length=1, max_length=512)]
 
 # 幂等键：仅允许 URL/Header 安全字符，便于客户端通过日志 / 链路追踪传递
@@ -432,4 +435,68 @@ class LimitCheckResponse(BaseModel):
         default=0,
         ge=0,
         description="仅超限时返回：建议等待毫秒数（至最老一笔成本滑出窗口）",
+    )
+
+
+class DependencySetRequest(BaseModel):
+    """保存任务的前置依赖定义（整体替换；空列表表示清除定义）。"""
+
+    dependencies: list[TaskKey] = Field(
+        examples=[["video-transcode:order-123", "video-transcode:order-456"]],
+        description=(
+            f"前置任务键列表，按首次出现顺序去重后最多 {DEPENDENCY_MAX_COUNT} 个；"
+            "是否依赖任务自身由服务端按路径中的 task_key 判定（自身依赖返回 422）。"
+            "空列表表示清除该任务的依赖定义。"
+        ),
+    )
+
+    @field_validator("dependencies")
+    @classmethod
+    def dedupe_and_bound(cls, v: list[str]) -> list[str]:
+        # 服务端按首次出现顺序去重；去重后仍超过上限才拒绝（422）
+        deduped = list(dict.fromkeys(v))
+        if len(deduped) > DEPENDENCY_MAX_COUNT:
+            raise ValueError(
+                f"dependencies must contain at most {DEPENDENCY_MAX_COUNT} "
+                f"unique task keys"
+            )
+        return deduped
+
+
+class DependencySetResponse(BaseModel):
+    """保存依赖定义的结果；冲突（成环 / 遍历超限）时回带当前已保存定义。"""
+
+    saved: bool = Field(
+        description="true 表示定义已整体替换；false 表示被拒绝，原定义保持不变",
+    )
+    task_key: str
+    dependencies: list[str] = Field(
+        default_factory=list,
+        description=(
+            "保存成功时为本次写入的定义（去重后、按请求顺序）；"
+            "被拒绝时为当前仍生效的旧定义（无定义时为空列表）"
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "仅失败（409）时返回：cycle（写入后将形成依赖环，含自身依赖）"
+            " / too_many_nodes（环检测遍历节点数超过 1024 上限）"
+        ),
+    )
+
+
+class DependencyReadyResponse(BaseModel):
+    """任务门禁就绪判定：全部直接前置任务都已提交持久结果时可执行。"""
+
+    task_key: str
+    ready: bool = Field(
+        description=(
+            "全部直接前置任务均已提交结果时为 true；"
+            "没有依赖定义的任务视为可执行，同样为 true"
+        ),
+    )
+    pending: list[str] = Field(
+        default_factory=list,
+        description="尚未提交结果的直接前置任务键（按依赖定义顺序去重）；为空表示就绪",
     )
